@@ -1,5 +1,7 @@
 # KissLight
 
+[**📦 立即下载 v1.0.0**](https://gitee.com/qiuzongman/kiss-light/releases/download/1.0.0/KissLight_x64_1.0.0.exe)
+
 轻量级 Windows 夜间模式控制器，基于 Rust + 原生 Win32 API。
 
 > 仅支持 Windows 10/11 64 位。极简设计，托盘常驻，滑块调节色温。
