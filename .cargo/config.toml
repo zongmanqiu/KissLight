@@ -1,0 +1,4 @@
+# Cargo 配置：编译中间产物与目标文件全部输出到 .build/target
+# 保持 .main 目录纯净（只含源码与项目文件）
+[build]
+target-dir = "../.build/target"

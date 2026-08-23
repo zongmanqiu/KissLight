@@ -1,0 +1,17 @@
+# Build artifacts
+../.build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo
+target/
+
+# Debug
+*.pdb
+*.d
