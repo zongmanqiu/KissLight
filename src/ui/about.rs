@@ -304,7 +304,7 @@ pub fn show_about_dialog(parent: HWND) {
         let mut y = 16i32;
 
         // 1. 大标题
-        let title_text = crate::core::util::wide("KissLight 1.0.0");
+        let title_text = crate::core::util::wide("KissLight 1.0.1");
         let h_title = CreateWindowExW(
             WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(title_text.as_ptr()),
             ws_win(0x01) | WS_CHILD | WS_VISIBLE,

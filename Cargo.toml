@@ -1,6 +1,6 @@
 [package]
 name = "kisslight"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "轻量 Windows 夜间模式控制器（Rust + 原生 Win32）"
 license = "AGPL-3.0-only"

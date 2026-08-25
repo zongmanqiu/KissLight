@@ -44,7 +44,7 @@ try {
     # 复制 exe 到 .build/ 并重命名
     $td = Join-Path $ProjectRoot ".build\target"
     $src = Join-Path $td "$p\KissLight_x64.exe"
-    $dst = Join-Path $ProjectRoot ".build\KissLight_x64_1.0.0.exe"
+    $dst = Join-Path $ProjectRoot ".build\KissLight_x64_1.0.1.exe"
     if (Test-Path $src) {
         Copy-Item $src $dst -Force
         $sz = (Get-Item $dst).Length

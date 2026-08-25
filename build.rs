@@ -38,8 +38,8 @@ fn main() {
     // 设置 VERSIONINFO 资源，让任务管理器显示正确的程序名称
     res.set("FileDescription", "KissLight");
     res.set("ProductName", "KissLight");
-    res.set("ProductVersion", "1.0.0");
-    res.set("FileVersion", "1.0.0");
+    res.set("ProductVersion", "1.0.1");
+    res.set("FileVersion", "1.0.1");
     res.set("CompanyName", "邱宗满");
     res.set("OriginalFilename", "KissLight_x64.exe");
     res.set("InternalName", "KissLight");

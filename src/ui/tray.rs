@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
@@ -54,6 +55,8 @@ const TRAY_TIMER: usize = 2;
 
 /// 主窗口句柄（由 `spawn` 记录，供托盘回调使用）。
 static MAIN_HWND: OnceLock<AtomicUsize> = OnceLock::new();
+/// Explorer 重启时 Windows 广播的注册消息 ID。
+static WM_TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
 fn main_hwnd() -> HWND {
     let v = MAIN_HWND.get().map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
@@ -257,6 +260,10 @@ fn run_tray_thread() {
         });
         let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
+        // 注册 Explorer 重启通知消息
+        let taskbar_msg = w!("TaskbarCreated");
+        let _ = WM_TASKBAR_CREATED.set(RegisterWindowMessageW(taskbar_msg));
+
         if !add_tray_icon(hwnd) {
             return;
         }
@@ -363,7 +370,17 @@ unsafe extern "system" fn wnd_proc(
             PostQuitMessage(0);
             LRESULT(0)
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => {
+            // Explorer 重启后重新添加托盘图标
+            if let Some(&tb_msg) = WM_TASKBAR_CREATED.get() {
+                if msg == tb_msg {
+                    let _ = add_tray_icon(hwnd);
+                    tick_update(hwnd);
+                    return LRESULT(0);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
     }
 }
 

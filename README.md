@@ -1,6 +1,6 @@
 # KissLight
 
-[**📦 立即下载 v1.0.0**](https://gitee.com/qiuzongman/kiss-light/releases/download/1.0.0/KissLight_x64_1.0.0.exe)
+[**📦 立即下载 v1.0.1**](https://gitee.com/qiuzongman/kiss-light/releases/download/1.0.1/KissLight_x64_1.0.1.exe)
 
 轻量级 Windows 夜间模式控制器，基于 Rust + 原生 Win32 API。
 
@@ -50,7 +50,7 @@ $env:CARGO_TARGET_DIR = "..\.build\target"
 cargo build --release
 ```
 
-产物：`../.build/KissLight_x64_1.0.0.exe`（约 0.4MB）
+产物：`../.build/KissLight_x64_1.0.1.exe`（约 0.4MB）
 
 ### 测试
 
