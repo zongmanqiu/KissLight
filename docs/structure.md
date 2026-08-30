@@ -90,7 +90,7 @@
 
 ```
 ../.build/
-├── KissLight_x64_1.0.1.exe    ← 发布版可执行文件
+├── KissLight_x64_1.0.2.exe    ← 发布版可执行文件
 └── target/                     ← Cargo 构建目录
 ```
 

@@ -23,14 +23,16 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
+use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
     KillTimer, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, CS_DBLCLKS, GWLP_USERDATA,
     HICON, ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WM_NULL, WNDCLASSW,
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -395,7 +397,38 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, windows::core::PCWSTR(quit.as_ptr()));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    let _ = SetForegroundWindow(hwnd);
-    let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None);
+    // TrackPopupMenu 的菜单 Z 序跟随前台窗口；托盘是后台隐藏窗口，
+    // 若 SetForegroundWindow 因前台权限限制失败，菜单会被任务栏遮挡。
+    if !SetForegroundWindow(hwnd).as_bool() {
+        force_foreground(hwnd);
+    }
+    let _ = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        None,
+    );
+    // 收尾消息：否则点击菜单外部取消时菜单可能不消失
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
+}
+
+/// 通过 AttachThreadInput 借用前台线程的输入队列，强制切换前台。
+unsafe fn force_foreground(hwnd: HWND) {
+    let fg = GetForegroundWindow();
+    if fg.is_invalid() {
+        return;
+    }
+    let cur_tid = GetWindowThreadProcessId(hwnd, None);
+    let fg_tid = GetWindowThreadProcessId(fg, None);
+    if cur_tid == 0 || fg_tid == 0 || cur_tid == fg_tid {
+        return;
+    }
+    if AttachThreadInput(cur_tid, fg_tid, true).as_bool() {
+        let _ = SetForegroundWindow(hwnd);
+        let _ = AttachThreadInput(cur_tid, fg_tid, false);
+    }
 }
