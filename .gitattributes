@@ -1,0 +1,34 @@
+# KissLight .gitattributes
+#
+# 目的：把行尾策略固定在仓库里，避免工具写盘后 CRLF/LF 漂移。
+# - .ps1 由 Windows PowerShell 5.1 直接执行：CRLF 最稳。
+# - .rs/.toml/.md/.py 保持 LF，diff 可读。
+# - 图片/可执行文件按二进制处理，禁止行尾转换。
+
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+Cargo.lock text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.xml   text eol=lf
+
+# 许可全文没有扩展名，git 认不出来，必须显式声明为文本（UTF-8 / LF）。
+LICENSE text eol=lf
+
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.exe  binary
+*.dll  binary
+*.lib  binary
+*.pdb  binary

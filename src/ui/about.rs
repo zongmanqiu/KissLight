@@ -1,105 +1,137 @@
-//! 关于对话框 —— 版本、作者、仓库链接、赞助二维码。
+//! 关于对话框：版本、仓库链接、作者、赞助二维码。
 //!
-//! 从 main.rs 提取。
-
-#![allow(non_snake_case)]
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+//! 链接是 `SS_NOTIFY` 静态控件 + `SetWindowSubclass`：点击打开浏览器，
+//! 悬停变蓝并在 `WM_MOUSELEAVE` 时复原。版本号取自 `CARGO_PKG_VERSION`。
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateDIBSection, GetDC, ReleaseDC, GetSysColorBrush,
-    SetTextColor, COLOR_WINDOW, DIB_RGB_COLORS, HFONT,
-    BITMAPINFO, BITMAPINFOHEADER,
+    CreateDIBSection, CreateFontIndirectW, GetDC, GetSysColorBrush, GetTextExtentPoint32W,
+    InvalidateRect, ReleaseDC, SelectObject, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
+    COLOR_WINDOW, DIB_RGB_COLORS, HBRUSH, HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClientRect,
-    GetDlgCtrlID, GetWindowRect, RegisterClassW, SendMessageW, ShowWindow,
-    SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW,
-    CS_DBLCLKS, HWND_TOP, HMENU, NONCLIENTMETRICSW, SPIF_SENDCHANGE, SPI_GETNONCLIENTMETRICS,
-    SPI_GETWORKAREA, SW_SHOW, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WM_SETICON,
-    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClientRect, GetDlgCtrlID,
+    GetPropW, GetWindowRect, RegisterClassW, RemovePropW, SendMessageW, SetPropW, SetWindowPos,
+    SystemParametersInfoW, CS_DBLCLKS, HMENU, HWND_TOP, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
+    SPI_GETWORKAREA, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETFONT, WM_SETICON, WNDCLASSW,
+    WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
-use super::window::KEEP_FONT;
+use super::panel::KEEP_FONT;
 
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
-const IDC_ABOUT_LINK: i32 = 4001;
-const IDC_ACK_LINK: i32 = 4002;
+const IDC_GITEE_LINK: i32 = 4001;
+const IDC_GITHUB_LINK: i32 = 4002;
+const GITEE_URL: &str = "https://gitee.com/qiuzongman/kiss-light";
+const GITHUB_URL: &str = "https://github.com/zongmanqiu/KissLight";
 
-// 二维码 PNG（由 build.rs 从 SVG 生成）
-const WECHAT_PNG: &[u8] = include_bytes!("../../image/WeChatPay.png");
-const ALIPAY_PNG: &[u8] = include_bytes!("../../image/ALiPay.png");
+/// 静态文本样式（winuser.h）：居中 / 接收鼠标 / 显示位图。
+const SS_CENTER: i32 = 0x01;
+const SS_BITMAP: i32 = 0x0E;
+const SS_NOTIFY: i32 = 0x0200;
+/// `STM_SETIMAGE`：给 `SS_BITMAP` 控件换图。
+const STM_SETIMAGE: u32 = 0x0172;
 
-static LINK_RECT: OnceLock<(i32, i32, i32, i32)> = OnceLock::new();
-static LINK_OLD_PROC: OnceLock<AtomicUsize> = OnceLock::new();
-static ACK_RECT: OnceLock<(i32, i32, i32, i32)> = OnceLock::new();
-static ACK_OLD_PROC: OnceLock<AtomicUsize> = OnceLock::new();
+// 二维码 PNG（随源码放在 assets/）
+const WECHAT_PNG: &[u8] = include_bytes!("../../assets/WeChatPay.png");
+const ALIPAY_PNG: &[u8] = include_bytes!("../../assets/ALiPay.png");
 
 // ---------------------------------------------------------------------------
-// 子类过程（链接点击 + 悬停变色）
+// 链接的悬停状态与点击
 // ---------------------------------------------------------------------------
-unsafe extern "system" fn link_subclass_proc(
-    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
-    _subclass_id: usize, _ref_data: usize,
-) -> LRESULT {
-    // 根据控件ID判断是哪个链接
-    let id = windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(hwnd);
-    let old_proc_addr = if id == IDC_ACK_LINK {
-        ACK_OLD_PROC.get().map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
-    } else {
-        LINK_OLD_PROC.get().map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
-    };
-    let old_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
-        std::mem::transmute(old_proc_addr);
-    match msg {
-        0x0084 /* WM_NCHITTEST */ => LRESULT(1),
-        0x0200 /* WM_MOUSEMOVE */ => {
-            use windows::Win32::UI::WindowsAndMessaging::{GetPropW, SetPropW};
-            let key = w!("hover");
-            let was_hover = GetPropW(hwnd, PCWSTR(key.as_ptr())).0;
-            if was_hover == std::ptr::null_mut() {
-                let _ = SetPropW(hwnd, PCWSTR(key.as_ptr()), windows::Win32::Foundation::HANDLE(1 as *mut _));
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
-            }
-            old_proc(hwnd, msg, wparam, lparam)
+/// 属性值只当布尔标记用、不解引用；`SetPropW` 接受任意 `HANDLE`。
+#[allow(clippy::manual_dangling_ptr)]
+fn hover_flag() -> HANDLE {
+    HANDLE(1 as *mut std::ffi::c_void)
+}
+
+fn set_hover(hwnd: HWND, hovering: bool) {
+    let key = w!("hover");
+    unsafe {
+        if hovering {
+            let _ = SetPropW(hwnd, key, hover_flag());
+        } else {
+            let _ = RemovePropW(hwnd, key);
         }
-        0x0201 /* WM_LBUTTONDOWN */ => {
-            if id == IDC_ACK_LINK {
-                open_ack_link();
-            } else {
-                open_gitee_link();
+        let _ = InvalidateRect(hwnd, None, true);
+    }
+}
+
+fn is_hovering(hwnd: HWND) -> bool {
+    unsafe { !GetPropW(hwnd, w!("hover")).0.is_null() }
+}
+
+fn open_url(url: &str) {
+    let target = crate::core::util::wide(url);
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND::default(),
+            w!("open"),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// 链接控件 ID → 仓库地址（控件 ID 缺失时这里会退化成同一个 URL，见 AGENTS.md 平台坑 5）。
+fn link_url(id: i32) -> &'static str {
+    if id == IDC_GITHUB_LINK {
+        GITHUB_URL
+    } else {
+        GITEE_URL
+    }
+}
+
+fn open_link(id: i32) {
+    open_url(link_url(id));
+}
+
+/// 链接控件的窗口过程：接管点击与悬停，其余交给 `DefSubclassProc`。
+unsafe extern "system" fn link_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    match msg {
+        // 让静态文本把鼠标消息当客户区处理
+        WM_NCHITTEST => LRESULT(1 /* HTCLIENT */),
+        WM_MOUSEMOVE => {
+            if !is_hovering(hwnd) {
+                set_hover(hwnd, true);
             }
+            // 鼠标离开控件时补一条 WM_MOUSELEAVE，否则悬停色不会复原
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            set_hover(hwnd, false);
             LRESULT(0)
         }
-        _ => old_proc(hwnd, msg, wparam, lparam)
-    }
-}
-
-fn open_gitee_link() {
-    unsafe {
-        let url = crate::core::util::wide("https://gitee.com/qiuzongman/kiss-light");
-        let _ = ShellExecuteW(
-            HWND::default(), w!("open"),
-            PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL,
-        );
-    }
-}
-
-fn open_ack_link() {
-    unsafe {
-        let url = crate::core::util::wide("https://github.com/kvnxiao/win-nightlight-cli");
-        let _ = ShellExecuteW(
-            HWND::default(), w!("open"),
-            PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL,
-        );
+        WM_LBUTTONDOWN => {
+            open_link(GetDlgCtrlID(hwnd));
+            LRESULT(0)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -107,63 +139,26 @@ fn open_ack_link() {
 // 窗口过程
 // ---------------------------------------------------------------------------
 unsafe extern "system" fn about_wndproc(
-    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_COMMAND => {
-            let id = (wparam.0 & 0xffff) as i32;
-            if id == IDC_ABOUT_LINK {
-                open_gitee_link();
-            } else if id == IDC_ACK_LINK {
-                open_ack_link();
-            }
-            LRESULT(0)
-        }
         WM_CTLCOLORSTATIC => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-            let ctrl = HWND(lparam.0 as *mut _);
-            let ctrl_id = GetDlgCtrlID(ctrl);
-            if ctrl_id == IDC_ABOUT_LINK || ctrl_id == IDC_ACK_LINK {
-                use windows::Win32::UI::WindowsAndMessaging::GetPropW;
-                let key = w!("hover");
-                let is_hover = GetPropW(ctrl, PCWSTR(key.as_ptr())).0 as usize != 0;
-                if is_hover {
-                    let _ = SetTextColor(hdc, COLORREF(0x000000FF));
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut std::ffi::c_void);
+            let control = HWND(lparam.0 as *mut std::ffi::c_void);
+            let id = GetDlgCtrlID(control);
+            if id == IDC_GITEE_LINK || id == IDC_GITHUB_LINK {
+                let color = if is_hovering(control) {
+                    COLORREF(0x0000_00FF) // 悬停：红
                 } else {
-                    let _ = SetTextColor(hdc, COLORREF(0x00FF0000));
-                }
+                    COLORREF(0x00FF_0000) // 常态：蓝
+                };
+                let _ = SetTextColor(hdc, color);
             }
-            let br = GetSysColorBrush(COLOR_WINDOW);
-            LRESULT(br.0 as isize)
-        }
-        0x0200 /* WM_MOUSEMOVE */ => {
-            let mx = (lparam.0 & 0xFFFF) as i16 as i32;
-            let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            use windows::Win32::UI::WindowsAndMessaging::{GetPropW, SetPropW};
-            let key = w!("hover");
-            // Gitee 链接
-            if let Some(&(lx, ly, lw, lh)) = LINK_RECT.get() {
-                let inside = mx >= lx && mx < lx + lw && my >= ly && my < ly + lh;
-                let link = super::window::dlg(hwnd, IDC_ABOUT_LINK);
-                let was_hover = GetPropW(link, PCWSTR(key.as_ptr())).0;
-                let is_hover_now = if inside { 1usize } else { 0usize };
-                if is_hover_now != was_hover as usize {
-                    let _ = SetPropW(link, PCWSTR(key.as_ptr()), windows::Win32::Foundation::HANDLE(is_hover_now as *mut _));
-                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(link, None, true);
-                }
-            }
-            // 致谢链接
-            if let Some(&(ax, ay, aw, ah)) = ACK_RECT.get() {
-                let inside = mx >= ax && mx < ax + aw && my >= ay && my < ay + ah;
-                let ack = super::window::dlg(hwnd, IDC_ACK_LINK);
-                let was_hover = GetPropW(ack, PCWSTR(key.as_ptr())).0;
-                let is_hover_now = if inside { 1usize } else { 0usize };
-                if is_hover_now != was_hover as usize {
-                    let _ = SetPropW(ack, PCWSTR(key.as_ptr()), windows::Win32::Foundation::HANDLE(is_hover_now as *mut _));
-                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(ack, None, true);
-                }
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            let background = GetSysColorBrush(COLOR_WINDOW);
+            LRESULT(background.0 as isize)
         }
         WM_DESTROY => LRESULT(0),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -171,250 +166,354 @@ unsafe extern "system" fn about_wndproc(
 }
 
 // ---------------------------------------------------------------------------
-// 辅助函数
+// 辅助
 // ---------------------------------------------------------------------------
-fn ws_win(v: u32) -> WINDOW_STYLE { WINDOW_STYLE(v) }
-
-fn make_static_center(hwnd: HWND, text: &str, x: i32, y: i32, w: i32, h: i32, font: HFONT) -> HWND {
-    let t = crate::core::util::wide(text);
-    let h = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(t.as_ptr()),
-            ws_win(0x01 /* SS_CENTER */) | WS_CHILD | WS_VISIBLE,
-            x, y, w, h, hwnd, HMENU(0 as _), None, None,
-        ).unwrap_or_default()
-    };
-    let _ = unsafe { SendMessageW(h, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1)) };
-    h
+fn control_id(id: i32) -> HMENU {
+    HMENU(id as isize as *mut std::ffi::c_void)
 }
 
-/// 从 PNG 字节解码创建 HBITMAP
-fn decode_png_to_bitmap(png_data: &[u8]) -> Option<(windows::Win32::Graphics::Gdi::HBITMAP, i32, i32)> {
+/// 窗口类背景刷：系统颜色索引 +1 是 Win32 的约定（不是指针）。
+#[allow(clippy::manual_dangling_ptr)]
+fn system_color_brush(index: i32) -> HBRUSH {
+    HBRUSH((index + 1) as isize as *mut std::ffi::c_void)
+}
+
+fn static_control(
+    hwnd: HWND,
+    id: i32,
+    text: &str,
+    (x, y, width, height): (i32, i32, i32, i32),
+    style: i32,
+    font: HFONT,
+) -> HWND {
+    let wide = crate::core::util::wide(text);
+    let control = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            PCWSTR(wide.as_ptr()),
+            WINDOW_STYLE(style as u32) | WS_CHILD | WS_VISIBLE,
+            x,
+            y,
+            width,
+            height,
+            hwnd,
+            control_id(id),
+            None,
+            None,
+        )
+        .unwrap_or_default()
+    };
+    unsafe {
+        let _ = SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+    control
+}
+
+fn centered_static(hwnd: HWND, text: &str, rect: (i32, i32, i32, i32), font: HFONT) -> HWND {
+    static_control(hwnd, 0, text, rect, SS_CENTER, font)
+}
+
+/// 链接控件：居中、可点击、悬停变色。
+fn link_static(hwnd: HWND, id: i32, text: &str, rect: (i32, i32, i32, i32), font: HFONT) -> HWND {
+    let control = static_control(hwnd, id, text, rect, SS_CENTER | SS_NOTIFY, font);
+    unsafe {
+        let _ = SetWindowSubclass(control, Some(link_proc), 1, 0);
+    }
+    control
+}
+
+fn text_width(hwnd: HWND, text: &str) -> i32 {
+    let wide = crate::core::util::wide(text);
+    let mut size = SIZE::default();
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if let Some(&font) = KEEP_FONT.get() {
+            let _ = SelectObject(hdc, HFONT(font as *mut std::ffi::c_void));
+        }
+        let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+        let _ = ReleaseDC(hwnd, hdc);
+    }
+    size.cx
+}
+
+/// 从 PNG 字节创建 HBITMAP（32bpp 顶行优先 DIB）。
+fn decode_png_to_bitmap(
+    png_data: &[u8],
+) -> Option<(windows::Win32::Graphics::Gdi::HBITMAP, i32, i32)> {
     unsafe {
         let decoder = png::Decoder::new(std::io::Cursor::new(png_data));
         let mut reader = decoder.read_info().ok()?;
-        let mut buf = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut buf).ok()?;
-        let raw = &buf[..info.buffer_size()];
-        let w = info.width as i32;
-        let h = info.height as i32;
+        let mut buffer = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buffer).ok()?;
+        let raw = &buffer[..info.buffer_size()];
+        let width = info.width as i32;
+        let height = info.height as i32;
         let hdc = GetDC(HWND::default());
-        let mut bi = BITMAPINFO::default();
-        bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
+        let bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        let dib = CreateDIBSection(hdc, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0)
+            .unwrap_or_default();
         if dib.is_invalid() || bits.is_null() {
             let _ = ReleaseDC(HWND::default(), hdc);
             return None;
         }
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
-        for (d, s) in dst.iter_mut().zip(raw.chunks_exact(4)) {
-            *d = (s[2] as u32) | (s[1] as u32) << 8 | (s[0] as u32) << 16 | (s[3] as u32) << 24;
+        // SAFETY: CreateDIBSection 给了 width*height 个 32bpp 像素（bits 非空、对齐要求
+        // 由 DIB 保证），这里按同一个尺寸构造切片并逐像素写入。
+        let destination =
+            std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize);
+        for (pixel, source) in destination.iter_mut().zip(raw.chunks_exact(4)) {
+            *pixel = u32::from(source[2])
+                | u32::from(source[1]) << 8
+                | u32::from(source[0]) << 16
+                | u32::from(source[3]) << 24;
         }
         let _ = ReleaseDC(HWND::default(), hdc);
-        Some((dib, w, h))
+        Some((dib, width, height))
+    }
+}
+
+fn create_qr(parent: HWND, x: i32, y: i32, size: i32, png: &[u8]) {
+    unsafe {
+        let control = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            PCWSTR::null(),
+            WINDOW_STYLE(SS_BITMAP as u32) | WS_CHILD | WS_VISIBLE,
+            x,
+            y,
+            size,
+            size,
+            parent,
+            HMENU::default(),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        if let Some((bitmap, _, _)) = decode_png_to_bitmap(png) {
+            let _ = SendMessageW(control, STM_SETIMAGE, WPARAM(0), LPARAM(bitmap.0 as isize));
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // 公开接口
 // ---------------------------------------------------------------------------
+/// 显示关于对话框；已存在时先关掉旧的。
 pub fn show_about_dialog(parent: HWND) {
     unsafe {
-        let class_name = w!("MemCleanerAbout");
+        let class_name = w!("KissLightAbout");
         let existing = FindWindowW(class_name, PCWSTR::null()).unwrap_or_default();
         if !existing.0.is_null() {
             let _ = DestroyWindow(existing);
         }
 
-        let hinst = GetModuleHandleW(None).unwrap_or_default();
-
-        let wc = WNDCLASSW {
+        let hinstance = GetModuleHandleW(None).unwrap_or_default();
+        let window_class = WNDCLASSW {
             style: CS_DBLCLKS,
             lpfnWndProc: Some(about_wndproc),
-            hInstance: hinst.into(),
+            hInstance: windows::Win32::Foundation::HINSTANCE(hinstance.0),
             lpszClassName: class_name,
-            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH((COLOR_WINDOW.0 as i32 + 1) as isize as *mut _),
+            hbrBackground: system_color_brush(COLOR_WINDOW.0),
             ..Default::default()
         };
-        RegisterClassW(&wc);
+        RegisterClassW(&window_class);
 
-        let style: WINDOW_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-        let qr_size_init = 200i32;
-        let qr_gap_init = 40i32;
-        let qr_total_w = qr_size_init * 2 + qr_gap_init;
-        let dlg_w = qr_total_w + 40;
-        let dlg_h = 500i32;
+        let style = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0);
+        let qr_size = 200i32;
+        let qr_gap = 40i32;
+        let content_width = qr_size * 2 + qr_gap;
+        let dialog_width = content_width + 40;
+        let dialog_height = 500i32;
 
-        // 先计算居中位置
+        // 先按工作区居中，窗口高度等布局完成后再收紧
         let mut work = RECT::default();
         let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA, 0,
-            Some(&mut work as *mut _ as *mut _),
-            SPIF_SENDCHANGE,
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut _ as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         );
-        let x = (work.left + work.right - dlg_w) / 2;
-        let y = (work.top + work.bottom - dlg_h) / 2;
+        let x = (work.left + work.right - dialog_width) / 2;
+        let y = (work.top + work.bottom - dialog_height) / 2;
 
-        // 直接在居中位置创建窗口
-        let hwnd = match CreateWindowExW(
-            WINDOW_EX_STYLE(0), class_name,
+        let Ok(hwnd) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
             w!("关于"),
             style | WS_VISIBLE,
-            x, y, dlg_w, dlg_h,
-            HWND(parent.0), None, hinst, None,
-        ) {
-            Ok(h) => h,
-            Err(_) => return,
+            x,
+            y,
+            dialog_width,
+            dialog_height,
+            parent,
+            None,
+            hinstance,
+            None,
+        ) else {
+            return;
         };
 
-        // 设置图标
-        let logo = super::window::load_logo_icon();
+        let logo = super::panel::load_logo_icon();
         let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(0), LPARAM(logo.0 as isize));
         let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(1), LPARAM(logo.0 as isize));
 
-        let mut client_rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut client_rc);
-        let cw = client_rc.right - client_rc.left;
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let client_width = client.right - client.left;
 
-        let mut ncm = NONCLIENTMETRICSW::default();
-        ncm.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+        let mut metrics = NONCLIENTMETRICSW {
+            cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+            ..Default::default()
+        };
         let _ = SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS, ncm.cbSize,
-            Some(&mut ncm as *mut _ as *mut _),
-            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            SPI_GETNONCLIENTMETRICS,
+            metrics.cbSize,
+            Some(&mut metrics as *mut _ as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         );
-        let font = windows::Win32::Graphics::Gdi::CreateFontIndirectW(&ncm.lfMessageFont);
+        let font = CreateFontIndirectW(&metrics.lfMessageFont);
 
-        let mut lf = ncm.lfMessageFont;
-        lf.lfHeight = lf.lfHeight * 16 / 10;
-        lf.lfWeight = 700;
-        let title_font = windows::Win32::Graphics::Gdi::CreateFontIndirectW(&lf);
+        let mut title_face = metrics.lfMessageFont;
+        title_face.lfHeight = title_face.lfHeight * 16 / 10;
+        title_face.lfWeight = 700;
+        let title_font = CreateFontIndirectW(&title_face);
 
-        let mut lf_u = ncm.lfMessageFont;
-        lf_u.lfUnderline = 1;
-        let link_font = windows::Win32::Graphics::Gdi::CreateFontIndirectW(&lf_u);
+        let mut link_face = metrics.lfMessageFont;
+        link_face.lfUnderline = 1;
+        let link_font = CreateFontIndirectW(&link_face);
 
         let margin = 20i32;
-        let content_w = cw - margin * 2;
-        let mut y = 16i32;
+        let width = client_width - margin * 2;
+        let mut cursor = 16i32;
 
-        // 1. 大标题
-        let title_text = crate::core::util::wide("KissLight 1.0.2");
-        let h_title = CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(title_text.as_ptr()),
-            ws_win(0x01) | WS_CHILD | WS_VISIBLE,
-            margin, y, content_w, 30, hwnd, HMENU(0 as _), None, None,
-        ).unwrap_or_default();
-        let _ = SendMessageW(h_title, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
-        y += 34;
+        // 标题（版本号来自 Cargo.toml，不手写）
+        let title = format!("KissLight {}", env!("CARGO_PKG_VERSION"));
+        centered_static(hwnd, &title, (margin, cursor, width, 30), title_font);
+        cursor += 34;
 
-        // 2. Gitee 仓库链接
-        let link_text = crate::core::util::wide("Gitee仓库");
-        let mut text_size = SIZE::default();
-        let hdc = GetDC(hwnd);
-        if let Some(&fh) = KEEP_FONT.get() {
-            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, HFONT(fh as *mut _));
-        }
-        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &link_text, &mut text_size);
-        let _ = ReleaseDC(hwnd, hdc);
-        let link_w = text_size.cx + 8;
-        let link_x = (content_w - link_w) / 2 + margin;
-        let h_link = CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(link_text.as_ptr()),
-            ws_win(0x01) | WS_CHILD | WS_VISIBLE | ws_win(0x0200),
-            link_x, y, link_w, 20, hwnd, HMENU(IDC_ABOUT_LINK as _), None, None,
-        ).unwrap_or_default();
-        let _ = SendMessageW(h_link, WM_SETFONT, WPARAM(link_font.0 as usize), LPARAM(1));
-        let _ = LINK_RECT.set((link_x, y, link_w, 20));
-        let old_proc = SetWindowLongPtrW(h_link, windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(-4), link_subclass_proc as *const () as isize);
-        let _ = LINK_OLD_PROC.set(AtomicUsize::new(old_proc as usize));
-        y += 44;
-
-        // 3. 作者和邮箱
-        make_static_center(hwnd, "Copyright \u{00A9} 2026 邱宗满", margin, y, content_w, 20, font);
-        y += 22;
-        make_static_center(hwnd, "qiuzongman@foxmail.com", margin, y, content_w, 20, font);
-        y += 22;
-        make_static_center(hwnd, "License: AGPL-3.0", margin, y, content_w, 20, font);
-        y += 44;
-
-        // 3.5 致谢链接
-        let ack_text = crate::core::util::wide("致谢: kvnxiao/win-nightlight-cli");
-        let mut ack_size = SIZE::default();
-        let hdc = GetDC(hwnd);
-        if let Some(&fh) = KEEP_FONT.get() {
-            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, HFONT(fh as *mut _));
-        }
-        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &ack_text, &mut ack_size);
-        let _ = ReleaseDC(hwnd, hdc);
-        let ack_w = ack_size.cx + 8;
-        let ack_x = (content_w - ack_w) / 2 + margin;
-        let h_ack = CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(ack_text.as_ptr()),
-            ws_win(0x01) | WS_CHILD | WS_VISIBLE | ws_win(0x0200),
-            ack_x, y, ack_w, 20, hwnd, HMENU(IDC_ACK_LINK as _), None, None,
-        ).unwrap_or_default();
-        let _ = SendMessageW(h_ack, WM_SETFONT, WPARAM(link_font.0 as usize), LPARAM(1));
-        let _ = ACK_RECT.set((ack_x, y, ack_w, 20));
-        let old_proc = SetWindowLongPtrW(h_ack, windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(-4), link_subclass_proc as *const () as isize);
-        let _ = ACK_OLD_PROC.set(AtomicUsize::new(old_proc as usize));
-        y += 44;
-
-        // 4. 赞助
-        make_static_center(hwnd, "赞助", margin, y, content_w, 20, font);
-        y += 24;
-
-        let qr_size = 200i32;
-        let qr_gap = 40i32;
-        let qr_total = qr_size * 2 + qr_gap;
-        let qr_start_x = (cw - qr_total) / 2;
-
-        make_static_center(hwnd, "微信", qr_start_x, y, qr_size, 18, font);
-        y += 20;
-        let h_wechat = CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(),
-            ws_win(0x0000000E /* SS_BITMAP */) | WS_CHILD | WS_VISIBLE,
-            qr_start_x, y, qr_size, qr_size, hwnd, HMENU(0 as _), None, None,
-        ).unwrap_or_default();
-        if let Some((bmp, _, _)) = decode_png_to_bitmap(WECHAT_PNG) {
-            let _ = SendMessageW(h_wechat, 0x0172 /* STM_SETIMAGE */, WPARAM(0), LPARAM(bmp.0 as isize));
-        }
-
-        make_static_center(hwnd, "支付宝", qr_start_x + qr_size + qr_gap, y - 20, qr_size, 18, font);
-        let h_alipay = CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR::null(),
-            ws_win(0x0000000E /* SS_BITMAP */) | WS_CHILD | WS_VISIBLE,
-            qr_start_x + qr_size + qr_gap, y, qr_size, qr_size, hwnd, HMENU(0 as _), None, None,
-        ).unwrap_or_default();
-        if let Some((bmp, _, _)) = decode_png_to_bitmap(ALIPAY_PNG) {
-            let _ = SendMessageW(h_alipay, 0x0172 /* STM_SETIMAGE */, WPARAM(0), LPARAM(bmp.0 as isize));
-        }
-        y += qr_size + 8;
-
-        // 调整窗口高度
-        let mut wrc = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut wrc);
-        let non_client_h = (wrc.bottom - wrc.top) - (client_rc.bottom - client_rc.top);
-        let final_h = y + non_client_h;
-        let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, dlg_w, final_h, SWP_NOMOVE | SWP_NOZORDER);
-
-        // 居中显示
-        let mut wa = RECT::default();
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA, 0,
-            Some(&mut wa as *mut _ as *mut _),
-            windows::Win32::UI::WindowsAndMessaging::SPIF_SENDCHANGE,
+        // 仓库链接：Gitee仓库 | GitHub仓库
+        let gitee_text = "Gitee仓库";
+        let github_text = "GitHub仓库";
+        let separator = "|";
+        let gitee_width = text_width(hwnd, gitee_text) + 4;
+        let github_width = text_width(hwnd, github_text) + 4;
+        let separator_width = text_width(hwnd, separator);
+        let gap = 12i32;
+        let row_width = gitee_width + gap + separator_width + gap + github_width;
+        let row_x = margin + (width - row_width) / 2;
+        link_static(
+            hwnd,
+            IDC_GITEE_LINK,
+            gitee_text,
+            (row_x, cursor, gitee_width, 20),
+            link_font,
         );
-        let _ = GetWindowRect(hwnd, &mut wrc);
-        let ww = wrc.right - wrc.left;
-        let wh = wrc.bottom - wrc.top;
-        let x = (wa.right - wa.left - ww) / 2 + wa.left;
-        let y = (wa.bottom - wa.top - wh) / 2 + wa.top;
+        centered_static(
+            hwnd,
+            separator,
+            (row_x + gitee_width + gap, cursor, separator_width, 20),
+            font,
+        );
+        link_static(
+            hwnd,
+            IDC_GITHUB_LINK,
+            github_text,
+            (
+                row_x + gitee_width + gap + separator_width + gap,
+                cursor,
+                github_width,
+                20,
+            ),
+            link_font,
+        );
+        cursor += 44;
+
+        // 作者 / 邮箱 / 许可
+        centered_static(
+            hwnd,
+            "Copyright \u{00A9} 2026 邱宗满",
+            (margin, cursor, width, 20),
+            font,
+        );
+        cursor += 22;
+        centered_static(
+            hwnd,
+            "qiuzongman@foxmail.com",
+            (margin, cursor, width, 20),
+            font,
+        );
+        cursor += 22;
+        centered_static(hwnd, "License: AGPL-3.0", (margin, cursor, width, 20), font);
+        cursor += 44;
+
+        // 赞助二维码
+        centered_static(hwnd, "赞助", (margin, cursor, width, 20), font);
+        cursor += 24;
+        let qr_total = qr_size * 2 + qr_gap;
+        let qr_start = (client_width - qr_total) / 2;
+
+        centered_static(hwnd, "微信", (qr_start, cursor, qr_size, 18), font);
+        cursor += 20;
+        create_qr(hwnd, qr_start, cursor, qr_size, WECHAT_PNG);
+        centered_static(
+            hwnd,
+            "支付宝",
+            (qr_start + qr_size + qr_gap, cursor - 20, qr_size, 18),
+            font,
+        );
+        create_qr(
+            hwnd,
+            qr_start + qr_size + qr_gap,
+            cursor,
+            qr_size,
+            ALIPAY_PNG,
+        );
+        cursor += qr_size + 8;
+
+        // 收紧高度并重新居中
+        let mut window_rect = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut window_rect);
+        let non_client_height =
+            (window_rect.bottom - window_rect.top) - (client.bottom - client.top);
+        let final_height = cursor + non_client_height;
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            dialog_width,
+            final_height,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+        let _ = GetWindowRect(hwnd, &mut window_rect);
+        let width = window_rect.right - window_rect.left;
+        let height = window_rect.bottom - window_rect.top;
+        let x = (work.right - work.left - width) / 2 + work.left;
+        let y = (work.bottom - work.top - height) / 2 + work.top;
         let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_link_opens_its_own_repository() {
+        assert_eq!(link_url(IDC_GITEE_LINK), GITEE_URL);
+        assert_eq!(link_url(IDC_GITHUB_LINK), GITHUB_URL);
+        assert_ne!(GITEE_URL, GITHUB_URL);
+        assert_ne!(IDC_GITEE_LINK, IDC_GITHUB_LINK);
     }
 }

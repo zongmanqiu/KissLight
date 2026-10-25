@@ -1,229 +1,78 @@
-//! 原生 Win32 系统托盘 + 后台消息循环。
+//! 原生 Win32 系统托盘（与主窗口共用同一个消息循环）。
 //!
-//! 后台线程创建隐藏窗口与托盘图标，独立 Win32 消息循环。
-//! - 托盘动作通过 `PostMessage` 发给主窗口：显示 / 按档位清理 / 退出
-//! - 图标实时显示「物理内存占用 %」，颜色随占用变（绿→黄→红），仅百分比变化才重绘
-//! - tooltip 实时显示 物理/页面/系统缓存 三项指标
-
-#![allow(non_snake_case)]
+//! 托盘窗口、托盘图标和主窗口都归 UI 线程所有：退出时先注销图标再销毁窗口，
+//! 进程不会在另一个界面线程仍停在 `Shell_NotifyIcon` 跨进程调用途中被终止
+//! （休眠唤醒后资源管理器繁忙时，这种终止会让系统弹出 “Unknown Hard Error”）。
+//!
+//! 托盘动作通过 `PostMessage` 发给主窗口，避免在菜单回调内部销毁窗口。
 
 use std::mem::size_of;
-use std::thread;
-
-use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM, BOOL};
-use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
-    GetStockObject, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW, TRANSPARENT,
-    DEFAULT_GUI_FONT, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
-use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
-};
-use windows::Win32::System::Threading::AttachThreadInput;
-use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
-    KillTimer, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, CS_DBLCLKS, GWLP_USERDATA,
-    HICON, ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WM_NULL, WNDCLASSW,
-};
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-// 移除对 mem 模块的引用
+use windows::core::w;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::AttachThreadInput;
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+    LoadIconW, PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA, HICON, IDI_APPLICATION,
+    MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP,
+    WNDCLASSW,
+};
 
-/// 托盘动作对应的自定义消息（发给主窗口）。
+/// 托盘动作对应的自定义消息（发给主面板）。
 pub const MSG_TRAY_SHOW: u32 = WM_APP + 1;
-pub const MSG_TRAY_CLEAN: u32 = WM_APP + 2;
 pub const MSG_TRAY_QUIT: u32 = WM_APP + 3;
 pub const MSG_TRAY_ABOUT: u32 = WM_APP + 4;
 
 const WM_TRAY: u32 = WM_APP + 10;
 const ID_SHOW: usize = 2001;
-const ID_CLEAN_STD: usize = 2002;
-const ID_CLEAN_DEEP: usize = 2003;
 const ID_ABOUT: usize = 2006;
 const ID_QUIT: usize = 2005;
 const TRAY_UID: u32 = 1;
-const TRAY_TIMER: usize = 2;
 
-/// 主窗口句柄（由 `spawn` 记录，供托盘回调使用）。
+/// 托盘窗口句柄（由 `init` 记录，供 `shutdown` 使用）。
+static TRAY_HWND: OnceLock<AtomicUsize> = OnceLock::new();
+/// 主窗口句柄（托盘动作转发目标）。
 static MAIN_HWND: OnceLock<AtomicUsize> = OnceLock::new();
 /// Explorer 重启时 Windows 广播的注册消息 ID。
 static WM_TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
+/// 菜单命令先暂存，等菜单关闭后再投递，避免在菜单回调里销毁窗口。
+static PENDING_COMMAND: AtomicUsize = AtomicUsize::new(0);
 
-fn main_hwnd() -> HWND {
-    let v = MAIN_HWND.get().map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
-    HWND(v as *mut _)
-}
-
-/// 启动托盘后台线程。`main_hwnd` 是主设置窗口句柄。
-pub fn spawn(main_hwnd: HWND) {
-    let a = MAIN_HWND.get_or_init(|| AtomicUsize::new(0));
-    a.store(main_hwnd.0 as usize, Ordering::Relaxed);
-    thread::spawn(run_tray_thread);
-}
-
-fn post_to_main(msg: u32) {
-    unsafe {
-        let _ = PostMessageW(main_hwnd(), msg, WPARAM(0), LPARAM(0));
-    }
-}
-
-/// 发送清理指令，wparam 携带档位（1/2/3）。
-fn post_clean(level: usize) {
-    unsafe {
-        let _ = PostMessageW(main_hwnd(), MSG_TRAY_CLEAN, WPARAM(level), LPARAM(0));
-    }
-}
-
-fn RGB(r: u32, g: u32, b: u32) -> u32 {
-    (b << 16) | (g << 8) | r
-}
-fn icon_bg_color(pct: u32) -> COLORREF {
-    // 三档：≤33% 绿，33%~66% 橙，>66% 红（与进度条一致）
-    if pct > 66 {
-        COLORREF(RGB(0xD0, 0x30, 0x30))
-    } else if pct > 33 {
-        COLORREF(RGB(0xE0, 0xA0, 0x10))
-    } else {
-        COLORREF(RGB(0x30, 0xA0, 0x50))
-    }
-}
-
-/// 渲染「内存占用 %」到 16x16 图标。数字按字形实际像素边界几何居中（避免 advance 空距导致的偏左）。
-fn render_tray_icon(pct: u32) -> HICON {
-    unsafe {
-        let s: i32 = 16;
-        let hdc = GetDC(HWND::default());
-        if hdc.is_invalid() {
-            return HICON::default();
-        }
-        // 32bpp top-down DIB，可直接读写像素数组
-        let mut bi = BITMAPINFO::default();
-        bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = s;
-        bi.bmiHeader.biHeight = -s; // 自顶向下
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
-        if dib.is_invalid() || bits.is_null() {
-            let _ = ReleaseDC(HWND::default(), hdc);
-            return HICON::default();
-        }
-        let px = std::slice::from_raw_parts_mut(bits as *mut u32, (s * s) as usize);
-        // icon_bg_color 返回 COLORREF（0x00BBGGRR），而 DIB 32bpp 像素内存序是 BGRA（低字节=蓝）。
-        // 若不转换，红色会被误读为蓝色。这里把 RGB 放到正确位置：0x00RRGGBB。
-        let cr = icon_bg_color(pct).0;
-        let bg = ((cr & 0xFF) << 16) | (cr & 0x00FF00) | ((cr >> 16) & 0xFF);
-        for p in px.iter_mut() {
-            *p = bg;
-        }
-
-        // 用 GDI 把白色数字画到 DIB
-        let mdc = CreateCompatibleDC(hdc);
-        let _ = SelectObject(mdc, dib);
-        let _ = SetBkMode(mdc, TRANSPARENT);
-        let _ = SetTextColor(mdc, COLORREF(RGB(0xFF, 0xFF, 0xFF)));
-        let font = GetStockObject(DEFAULT_GUI_FONT);
-        let _ = SelectObject(mdc, font);
-        let text = util_wide(&format!("{pct}"));
-
-        // 先画到临时位置，测量字形边界，再居中重画
-        let _ = TextOutW(mdc, 0, 0, &text);
-        // 扫描字形边界
-        let mut lo = s; let mut hi = -1i32;
-        let mut tr = s; let mut bo = -1i32;
-        for row in 0..s {
-            for col in 0..s {
-                let v = px[(row * s + col) as usize];
-                let b = (v & 0xFF) as u8;
-                let g = ((v >> 8) & 0xFF) as u8;
-                let r = ((v >> 16) & 0xFF) as u8;
-                // 白色或近白色像素 = 文字
-                if r > 200 && g > 200 && b > 200 {
-                    if col < lo { lo = col; }
-                    if col > hi { hi = col; }
-                    if row < tr { tr = row; }
-                    if row > bo { bo = row; }
-                }
-            }
-        }
-        // 清除旧位置，居中重画
-        if lo <= hi && tr <= bo {
-            let gw = hi - lo + 1;
-            let gh = bo - tr + 1;
-            let dx = (s - gw) / 2 - lo;
-            let dy = (s - gh) / 2 - tr;
-            // 清除整个背景
-            for p in px.iter_mut() { *p = bg; }
-            // 在居中位置重画
-            let _ = TextOutW(mdc, dx, dy, &text);
-        }
-
-        let mask = CreateBitmap(s, s, 1, 1, None);
-        let ii = ICONINFO {
-            fIcon: BOOL(1),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: dib,
-        };
-        let icon = CreateIconIndirect(&ii).unwrap_or_default();
-
-        let _ = DeleteObject(dib);
-        let _ = DeleteObject(mask);
-        let _ = DeleteDC(mdc);
-        let _ = ReleaseDC(HWND::default(), hdc);
-
-        icon
-    }
-}
-
-fn util_wide(s: &str) -> Vec<u16> {
-    crate::core::util::wide(s)
-}
-
-/// 托盘窗口附加状态。
 struct TrayState {
-    last_pct: u32,
     icon: HICON,
 }
 
-fn tick_update(hwnd: HWND) {
-    unsafe {
-        let st = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
-        if st.is_null() {
-            return;
-        }
-        let st = &mut *st;
-
-        // 不显示 tooltip 信息
-        let mut nid = NOTIFYICONDATAW {
-            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: TRAY_UID,
-            uFlags: NIF_TIP,
-            uCallbackMessage: WM_TRAY,
-            hIcon: st.icon,
-            ..Default::default()
-        };
-        // 设置空的 tooltip
-        nid.szTip[0] = 0;
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
+fn tray_hwnd() -> HWND {
+    let v = TRAY_HWND
+        .get()
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    HWND(v as *mut _)
 }
 
-fn run_tray_thread() {
+fn main_hwnd() -> HWND {
+    let v = MAIN_HWND
+        .get()
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    HWND(v as *mut _)
+}
+
+/// 创建托盘窗口与图标。失败时返回 false（主窗口仍可运行）。
+pub fn init(main: HWND) -> bool {
+    MAIN_HWND
+        .get_or_init(|| AtomicUsize::new(0))
+        .store(main.0 as usize, Ordering::Relaxed);
+
     unsafe {
         let hinstance = GetModuleHandleW(None).unwrap_or_default();
         let class_name = w!("KissLightTrayWindow");
@@ -237,7 +86,7 @@ fn run_tray_thread() {
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("MemCleanerTray"),
+            w!("KissLightTray"),
             WINDOW_STYLE(0),
             0,
             0,
@@ -248,46 +97,52 @@ fn run_tray_thread() {
             hinstance,
             None,
         ) else {
-            return;
+            return false;
         };
         if hwnd.0.is_null() {
-            return;
+            return false;
         }
+        TRAY_HWND
+            .get_or_init(|| AtomicUsize::new(0))
+            .store(hwnd.0 as usize, Ordering::Relaxed);
 
-        // 初始状态 - 使用 logo 图标
-        let initial_icon = super::window::load_logo_icon();
-        let state = Box::new(TrayState {
-            last_pct: 0,
-            icon: initial_icon,
-        });
+        let initial_icon = super::panel::load_logo_icon();
+        let state = Box::new(TrayState { icon: initial_icon });
         let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-        // 注册 Explorer 重启通知消息
-        let taskbar_msg = w!("TaskbarCreated");
-        let _ = WM_TASKBAR_CREATED.set(RegisterWindowMessageW(taskbar_msg));
+        let _ = WM_TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
-        if !add_tray_icon(hwnd) {
-            return;
-        }
-        // 每秒刷新图标 + tooltip
-        let _ = SetTimer(hwnd, TRAY_TIMER, 1000, None);
+        add_tray_icon(hwnd)
+    }
+}
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-
-        // 清理
-        let _ = KillTimer(hwnd, TRAY_TIMER);
+/// 退出前调用：注销托盘图标 → 释放图标句柄 → 销毁托盘窗口。
+/// 全部在 UI 线程完成，调用返回后进程不再持有任何窗口或图标。
+pub fn shutdown() {
+    let hwnd = tray_hwnd();
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        // 先从任务栏注销，图标句柄才可以释放。
+        delete_tray_icon(hwnd);
         let st = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
         if !st.is_null() {
-            let boxed: Box<TrayState> = Box::from_raw(st);
-            if !boxed.icon.is_invalid() {
-                let _ = DestroyIcon(boxed.icon);
+            let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            // SAFETY: st 来自 init() 里的 Box::into_raw，且这里先把 GWLP_USERDATA
+            // 置零——此后没有代码能再拿到这个指针，只回收一次。
+            let state = Box::from_raw(st);
+            if !state.icon.is_invalid() {
+                let _ = DestroyIcon(state.icon);
             }
         }
-        delete_tray_icon(hwnd);
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+fn post_to_main(msg: u32) {
+    unsafe {
+        let _ = PostMessageW(main_hwnd(), msg, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -299,7 +154,6 @@ fn add_tray_icon(hwnd: HWND) -> bool {
         } else {
             (*st).icon
         };
-        // 构造初始 tooltip
         let tip = "KissLight - 夜间模式控制器".to_string();
         let tip_wide = crate::core::util::wide(&tip);
         let mut nid = NOTIFYICONDATAW {
@@ -312,9 +166,7 @@ fn add_tray_icon(hwnd: HWND) -> bool {
             ..Default::default()
         };
         let copy_len = tip_wide.len().min(127);
-        for (i, &ch) in tip_wide[..copy_len].iter().enumerate() {
-            nid.szTip[i] = ch;
-        }
+        nid.szTip[..copy_len].copy_from_slice(&tip_wide[..copy_len]);
         nid.szTip[copy_len] = 0;
         Shell_NotifyIconW(NIM_ADD, &nid).as_bool()
     }
@@ -350,26 +202,15 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_COMMAND => {
             match wparam.0 & 0xffff {
-                ID_SHOW => post_to_main(MSG_TRAY_SHOW),
-                ID_CLEAN_STD => post_clean(1),
-                ID_CLEAN_DEEP => post_clean(2),
-                ID_ABOUT => post_to_main(MSG_TRAY_ABOUT),
-                ID_QUIT => {
-                    post_to_main(MSG_TRAY_QUIT);
-                    PostQuitMessage(0);
-                }
+                ID_SHOW => PENDING_COMMAND.store(MSG_TRAY_SHOW as usize, Ordering::Relaxed),
+                ID_ABOUT => PENDING_COMMAND.store(MSG_TRAY_ABOUT as usize, Ordering::Relaxed),
+                ID_QUIT => PENDING_COMMAND.store(MSG_TRAY_QUIT as usize, Ordering::Relaxed),
                 _ => {}
             }
             LRESULT(0)
         }
-        WM_TIMER => {
-            if wparam.0 == TRAY_TIMER {
-                tick_update(hwnd);
-            }
-            LRESULT(0)
-        }
         WM_DESTROY => {
-            PostQuitMessage(0);
+            // 不在这里 PostQuitMessage：消息循环由主窗口的 WM_DESTROY 结束。
             LRESULT(0)
         }
         _ => {
@@ -377,7 +218,6 @@ unsafe extern "system" fn wnd_proc(
             if let Some(&tb_msg) = WM_TASKBAR_CREATED.get() {
                 if msg == tb_msg {
                     let _ = add_tray_icon(hwnd);
-                    tick_update(hwnd);
                     return LRESULT(0);
                 }
             }
@@ -388,13 +228,28 @@ unsafe extern "system" fn wnd_proc(
 
 unsafe fn show_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().unwrap_or_default();
-    let show = crate::core::util::wide("显示窗口");
+    let show = crate::core::util::wide("窗口");
     let about = crate::core::util::wide("关于");
-    let quit = crate::core::util::wide("完全退出");
-    let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, windows::core::PCWSTR(show.as_ptr()));
+    let quit = crate::core::util::wide("退出");
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_SHOW,
+        windows::core::PCWSTR(show.as_ptr()),
+    );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, windows::core::PCWSTR(about.as_ptr()));
-    let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, windows::core::PCWSTR(quit.as_ptr()));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_ABOUT,
+        windows::core::PCWSTR(about.as_ptr()),
+    );
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_QUIT,
+        windows::core::PCWSTR(quit.as_ptr()),
+    );
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     // TrackPopupMenu 的菜单 Z 序跟随前台窗口；托盘是后台隐藏窗口，
@@ -414,6 +269,11 @@ unsafe fn show_menu(hwnd: HWND) {
     // 收尾消息：否则点击菜单外部取消时菜单可能不消失
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
+
+    let command = PENDING_COMMAND.swap(0, Ordering::Relaxed);
+    if command != 0 {
+        post_to_main(command as u32);
+    }
 }
 
 /// 通过 AttachThreadInput 借用前台线程的输入队列，强制切换前台。

@@ -1,8 +1,6 @@
-//! 核心纯逻辑层 —— 不依赖任何 UI 代码。
-//!
-//! 包含夜间模式控制、配置持久化、工具函数。
+//! 核心纯逻辑层 —— 不依赖 UI，也不直接使用 `windows` crate（可测性的根基）。
 
-pub mod config;
 pub mod gamma;
 pub mod nightlight;
+pub mod temp;
 pub mod util;

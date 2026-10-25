@@ -1,4 +1,8 @@
-# Cargo 配置：编译中间产物与目标文件全部输出到 .build/target
-# 保持 .main 目录纯净（只含源码与项目文件）
+# 编译中间产物全部输出到项目根的 .temp（仓库保持纯净，见 AGENTS.md）
 [build]
-target-dir = "../.build/target"
+target-dir = "../.temp/target"
+
+# 静态链接 MSVC 运行库：用户机器无需 VC++ Redistributable（解压即用）。
+# 代价是 exe 增大（实测 360KB -> 415KB）；收益是去掉 VCRUNTIME140.dll 依赖。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

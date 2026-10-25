@@ -1,4 +1,5 @@
-//! kisslight 库 —— 核心模块公开给集成测试和外部使用者。
+//! KissLight 库入口：`main` 与集成测试共用同一套模块。
 
+pub mod app;
 pub mod core;
 pub mod ui;
