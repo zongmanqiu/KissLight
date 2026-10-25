@@ -1,7 +1,7 @@
 # KissLight — 轻量 Windows 夜间模式控制器
 
-**[⬇️ 下载 1.1.0 (Gitee)](https://gitee.com/qiuzongman/kiss-light/releases/download/1.1.0/KissLight.zip)**
- ｜ **[⬇️ 下载 1.1.0 (GitHub)](https://github.com/zongmanqiu/KissLight/releases/download/1.1.0/KissLight.zip)**
+**[⬇️ 下载 1.1.0 (Gitee)](https://gitee.com/qiuzongman/kiss-light/releases/download/1.1.0/KissLight_x64_1.1.0.zip)**
+ ｜ **[⬇️ 下载 1.1.0 (GitHub)](https://github.com/zongmanqiu/KissLight/releases/download/1.1.0/KissLight_x64_1.1.0.zip)**
  ｜ [Gitee主仓](https://gitee.com/qiuzongman/kiss-light)
  ｜ [GitHub镜像](https://github.com/zongmanqiu/KissLight)
 
