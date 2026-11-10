@@ -1,3 +1,10 @@
+# 项目不再开发
+功能已经被ahk脚本替代，本项目不再开发。
+具体可以见 [AHKDeck](https://gitee.com/qiuzongman/AHKDeck) 和 [夜灯](https://gitee.com/qiuzongman/ahk-v2-scripts/blob/master/2026/%E5%A4%9C%E7%81%AF.ahk)
+
+
+#######################################
+
 # KissLight — 轻量 Windows 夜间模式控制器
 
 **[⬇️ 下载 1.1.0 (Gitee)](https://gitee.com/qiuzongman/kiss-light/releases/download/1.1.0/KissLight_x64_1.1.0.zip)**
