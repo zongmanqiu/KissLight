@@ -3,7 +3,6 @@
 具体可以见 [AHKDeck](https://gitee.com/qiuzongman/AHKDeck) 和 [夜灯](https://gitee.com/qiuzongman/ahk-v2-scripts/blob/master/2026/%E5%A4%9C%E7%81%AF.ahk) 。
 
 
-#######################################
 
 # KissLight — 轻量 Windows 夜间模式控制器
 
